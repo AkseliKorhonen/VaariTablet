@@ -94,6 +94,19 @@ export default defineSchema({
       "recipientId",
       "senderDeviceId",
     ]),
+  missedCalls: defineTable({
+    callId: v.id("calls"),
+    familyId: v.id("families"),
+    callerId: v.id("users"),
+    calleeId: v.id("users"),
+    missedAt: v.number(),
+  })
+    .index("by_callId", ["callId"])
+    .index("by_calleeId_and_familyId_and_missedAt", [
+      "calleeId",
+      "familyId",
+      "missedAt",
+    ]),
   pushTokens: defineTable({
     userId: v.id("users"),
     platform: v.union(v.literal("android"), v.literal("ios")),

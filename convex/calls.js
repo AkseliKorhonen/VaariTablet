@@ -80,6 +80,22 @@ async function deleteIceCandidates(ctx, callId) {
   }
 }
 
+async function recordMissedCall(ctx, call, missedAt) {
+  const existing = await ctx.db
+    .query("missedCalls")
+    .withIndex("by_callId", (q) => q.eq("callId", call._id))
+    .unique();
+  if (existing !== null) return existing._id;
+
+  return await ctx.db.insert("missedCalls", {
+    callId: call._id,
+    familyId: call.familyId,
+    callerId: call.callerId,
+    calleeId: call.calleeId,
+    missedAt,
+  });
+}
+
 async function hasBusyCall(ctx, userId) {
   const [ringingAsCaller, ringingAsCallee, activeAsCaller, activeAsCallee] =
     await Promise.all([
@@ -229,6 +245,36 @@ export const watch = query({
       call: callSummary,
       candidates,
     };
+  },
+});
+
+export const listMissed = query({
+  args: { familyId: v.id("families") },
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    await requireFamilyMembership(ctx, args.familyId, userId);
+
+    const missedCalls = await ctx.db
+      .query("missedCalls")
+      .withIndex("by_calleeId_and_familyId_and_missedAt", (q) =>
+        q.eq("calleeId", userId).eq("familyId", args.familyId),
+      )
+      .order("desc")
+      .take(5);
+
+    return await Promise.all(missedCalls.map(async (missedCall) => {
+      const caller = await ctx.db.get(missedCall.callerId);
+      return {
+        _id: missedCall._id,
+        callId: missedCall.callId,
+        callerId: missedCall.callerId,
+        missedAt: missedCall.missedAt,
+        caller: {
+          email: caller?.email ?? null,
+          name: caller?.name ?? null,
+        },
+      };
+    }));
   },
 });
 
@@ -472,11 +518,15 @@ export const end = mutation({
       throw new Error("This device does not own the call");
     }
 
+    const endedAt = Date.now();
     await ctx.db.patch(call._id, {
       status: "ended",
-      endedAt: Date.now(),
+      endedAt,
       endedBy: userId,
     });
+    if (call.status === "ringing" && userId === call.callerId) {
+      await recordMissedCall(ctx, call, endedAt);
+    }
     await deleteIceCandidates(ctx, call._id);
     await ctx.scheduler.runAfter(0, internal.callNotifications.sendResolved, {
       callId: call._id,
@@ -599,6 +649,9 @@ export const expireStale = internalMutation({
         status: "ended",
         endedAt: now,
       });
+      if (call.status === "ringing") {
+        await recordMissedCall(ctx, call, now);
+      }
       await deleteIceCandidates(ctx, call._id);
       await ctx.scheduler.runAfter(0, internal.callNotifications.sendResolved, {
         callId: call._id,

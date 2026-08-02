@@ -18,6 +18,7 @@ import {
   isStaleNegotiationError,
   retryCallOperation,
 } from "../../../../shared/call-retry";
+import { formatCallTime } from "../../../../shared/call-time";
 
 type Member = {
   email: string | null;
@@ -71,6 +72,16 @@ type PendingIceCandidate = {
   sdpMLineIndex?: number;
   usernameFragment?: string;
   negotiationRevision: number;
+};
+
+type MissedCall = {
+  _id: Id<"missedCalls">;
+  callerId: Id<"users">;
+  missedAt: number;
+  caller: {
+    email: string | null;
+    name: string | null;
+  };
 };
 
 type Call = NonNullable<CallSnapshot["call"]>;
@@ -153,7 +164,7 @@ export function FamilyCallPanel({
   members,
   onCallSurfaceChange,
 }: Props) {
-  const { t, tError } = useLanguage();
+  const { language, t, tError } = useLanguage();
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const callSurfaceRef = useRef<HTMLDivElement | null>(null);
@@ -197,6 +208,7 @@ export function FamilyCallPanel({
     api.calls.watch,
     deviceId ? { deviceId, familyId } : "skip",
   ) as CallSnapshot | undefined;
+  const missedCalls = useQuery(api.calls.listMissed, { familyId }) as MissedCall[] | undefined;
   const startCall = useMutation(api.calls.start);
   const answerCall = useMutation(api.calls.answer);
   const declineCall = useMutation(api.calls.decline);
@@ -782,12 +794,13 @@ export function FamilyCallPanel({
     if (!activeCall || !deviceId || !isOwnedCall) {
       return;
     }
+    const isCanceling = activeCall.status === "ringing" && activeCall.callerId === currentUserId;
     setBusyUserId(currentRemoteUserId);
     setCallError(null);
     try {
       await endCall({ callId: activeCall._id, deviceId });
     } catch (error) {
-      setCallError(tError(error, "Could not end the call."));
+      setCallError(tError(error, isCanceling ? "Could not cancel the call." : "Could not end the call."));
     } finally {
       teardownConnection(true);
       setBusyUserId(null);
@@ -814,6 +827,10 @@ export function FamilyCallPanel({
   };
 
   const isOnCall = activeCall !== null;
+  const isOutgoingCallAttempt =
+    activeCall?.status === "ringing"
+    && activeCall.callerId === currentUserId
+    && isOwnedCall;
   const isIncoming = incomingCall !== null;
   const canRequestAutoAnswer =
     activeCall?.status === "ringing"
@@ -955,7 +972,7 @@ export function FamilyCallPanel({
             onClick={onHangUp}
             type="button"
           >
-            {t("Hang up")}
+            {t(isOutgoingCallAttempt ? "Cancel call" : "Hang up")}
           </button>
         ) : null}
       </div>
@@ -970,6 +987,40 @@ export function FamilyCallPanel({
         <p className="rounded-2xl border border-sky-300/30 bg-sky-300/10 px-4 py-3 text-sm text-sky-100">
           {callOnAnotherDeviceMessage}
         </p>
+      ) : null}
+
+      {!isOnCall && missedCalls && missedCalls.length > 0 ? (
+        <section className="rounded-2xl border border-sky-300/30 bg-sky-300/10 px-4 py-4" aria-labelledby="missed-calls-title">
+          <h4 className="text-base font-semibold text-sky-100" id="missed-calls-title">
+            {t("Missed calls")}
+          </h4>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            {missedCalls.map((missedCall) => {
+              const member = members.find((candidate) => candidate.userId === missedCall.callerId);
+              const label = memberLabel(member ?? {
+                email: missedCall.caller.email,
+                image: null,
+                joinedAt: 0,
+                name: missedCall.caller.name,
+                role: "member",
+                userId: missedCall.callerId,
+              });
+              return (
+                <div className="flex min-w-0 items-center gap-3" key={missedCall._id}>
+                  <MemberAvatar className="size-10" image={member?.image ?? null} label={label} />
+                  <div className="min-w-0">
+                    <p className="break-words text-sm font-medium text-stone-50">
+                      {t("Missed call from {name}", { name: label })}
+                    </p>
+                    <time className="text-xs text-sky-200" dateTime={new Date(missedCall.missedAt).toISOString()}>
+                      {formatCallTime(missedCall.missedAt, language)}
+                    </time>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
       ) : null}
 
       {isOwnedCall && connectionStatus === "reconnecting" ? (

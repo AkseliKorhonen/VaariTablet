@@ -48,6 +48,7 @@ import {
   isStaleNegotiationError,
   retryCallOperation,
 } from "../../shared/call-retry";
+import { formatCallTime } from "../../shared/call-time";
 
 type Member = {
   email: string | null;
@@ -106,6 +107,16 @@ type PendingCandidate = {
   sdpMLineIndex?: number;
   usernameFragment?: string;
   negotiationRevision: number;
+};
+
+type MissedCall = {
+  _id: Id<"missedCalls">;
+  callerId: Id<"users">;
+  missedAt: number;
+  caller: {
+    email: string | null;
+    name: string | null;
+  };
 };
 
 type RemoteTrack = ReturnType<MediaStream["getTracks"]>[number];
@@ -197,7 +208,7 @@ export function FamilyCallPanel({
   onSelectFamily,
   seniorMode,
 }: Props) {
-  const { t, tError } = useLanguage();
+  const { language, t, tError } = useLanguage();
   const insets = useSafeAreaInsets();
   const {
     height,
@@ -253,6 +264,7 @@ export function FamilyCallPanel({
   const submitIceRestartOffer = useMutation(api.calls.submitIceRestartOffer);
   const submitIceRestartAnswer = useMutation(api.calls.submitIceRestartAnswer);
   const callState = useQuery(api.calls.watch, { deviceId, familyId }) as CallSnapshot | undefined;
+  const missedCalls = useQuery(api.calls.listMissed, { familyId }) as MissedCall[] | undefined;
   watchRef.current = callState;
 
   const activeCall = callState?.call ?? null;
@@ -1062,12 +1074,19 @@ export function FamilyCallPanel({
         locallyOwnedCallIdRef.current,
       )
     ) return;
+    const isCanceling = call.status === "ringing" && call.callerId === currentUserId;
     setBusy(true); setError(null);
-    try { await endCall({ callId: call._id, deviceId }); } catch (callError) { setError(tError(callError, "Could not end the call.")); }
+    try { await endCall({ callId: call._id, deviceId }); } catch (callError) {
+      setError(tError(callError, isCanceling ? "Could not cancel the call." : "Could not end the call."));
+    }
     finally { teardown(); setBusy(false); }
   };
 
   const isConnected = activeCall?.status === "active" && isOwnedCall;
+  const isOutgoingCallAttempt =
+    activeCall?.status === "ringing"
+    && activeCall.callerId === currentUserId
+    && isOwnedCall;
   const canRequestAutoAnswer =
     activeCall?.status === "ringing"
     && activeCall.callerId === currentUserId
@@ -1115,7 +1134,7 @@ export function FamilyCallPanel({
     isLandscape,
     isTablet,
     memberCount: seniorModeMembers.length,
-    reservedVerticalSpace: isCompactLandscape ? 140 : isTablet ? 180 : 160,
+    reservedVerticalSpace: isCompactLandscape ? 180 : isTablet ? 230 : 210,
     width,
   });
 
@@ -1230,6 +1249,14 @@ export function FamilyCallPanel({
                 {t("Automatic answering requested. Waiting for the other device to connect…")}
               </Text>
             ) : null}
+            {isOutgoingCallAttempt ? (
+              <Action
+                danger
+                disabled={busy}
+                label={t("Cancel call")}
+                onPress={() => void hangUp()}
+              />
+            ) : null}
             {error ? <Text accessibilityLiveRegion="assertive" style={styles.callModalErrorText}>{error}</Text> : null}
           </ScrollView>
         ) : null}
@@ -1334,6 +1361,33 @@ export function FamilyCallPanel({
             );
           })}
         </View>
+        {missedCalls && missedCalls.length > 0 ? (
+          <View style={styles.seniorMissedCalls}>
+            <Text style={styles.seniorMissedCallsTitle}>{t("Missed calls")}</Text>
+            {missedCalls.slice(0, 3).map((missedCall) => {
+              const member = members.find((candidate) => candidate.userId === missedCall.callerId);
+              const label = memberLabel(member ?? {
+                email: missedCall.caller.email,
+                image: null,
+                name: missedCall.caller.name,
+                userId: missedCall.callerId,
+              });
+              return (
+                <View key={missedCall._id} style={styles.seniorMissedCallRow}>
+                  <MemberAvatar image={member?.image ?? null} label={label} size={48} />
+                  <View style={styles.missedCallText}>
+                    <Text style={styles.seniorMissedCallName}>
+                      {t("Missed call from {name}", { name: label })}
+                    </Text>
+                    <Text style={styles.seniorMissedCallTime}>
+                      {formatCallTime(missedCall.missedAt, language)}
+                    </Text>
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        ) : null}
         {isCallOnAnotherDevice ? (
           <Text accessibilityLiveRegion="polite" style={styles.seniorMessage}>
             {callOnAnotherDeviceMessage}
@@ -1364,6 +1418,34 @@ export function FamilyCallPanel({
       <Text style={styles.kicker}>{t("FAMILY CALLS")}</Text>
       <Text style={styles.title}>{isCallOnAnotherDevice ? t("Call in progress") : activeCall ? t("Calling {name}", { name: memberLabel(remoteMember) }) : t("Face-to-face check-ins")}</Text>
       {error ? <Text style={styles.error}>{error}</Text> : null}
+      {activeCall === null && missedCalls && missedCalls.length > 0 ? (
+        <View style={styles.missedCalls}>
+          <Text style={styles.missedCallsTitle}>{t("Missed calls")}</Text>
+          {missedCalls.map((missedCall) => {
+            const member = members.find((candidate) => candidate.userId === missedCall.callerId);
+            const label = memberLabel(member ?? {
+              email: missedCall.caller.email,
+              image: null,
+              name: missedCall.caller.name,
+              userId: missedCall.callerId,
+            });
+            return (
+              <View
+                accessibilityLabel={`${t("Missed call from {name}", { name: label })}, ${formatCallTime(missedCall.missedAt, language)}`}
+                accessible
+                key={missedCall._id}
+                style={styles.missedCallRow}
+              >
+                <MemberAvatar image={member?.image ?? null} label={label} size={38} />
+                <View style={styles.missedCallText}>
+                  <Text style={styles.missedCallName}>{t("Missed call from {name}", { name: label })}</Text>
+                  <Text style={styles.missedCallTime}>{formatCallTime(missedCall.missedAt, language)}</Text>
+                </View>
+              </View>
+            );
+          })}
+        </View>
+      ) : null}
       {isCallOnAnotherDevice ? <View style={styles.resolvedElsewhere}><Text style={styles.resolvedElsewhereText}>{callOnAnotherDeviceMessage}</Text></View> : activeCall && isOwnedCall && !isConnected ? <>
         <View style={[styles.videoGrid, { height: embeddedVideoHeight }]}>
           <View style={styles.video}>{remoteStream ? <RTCView mirror={false} objectFit="cover" streamURL={remoteStream.toURL()} style={styles.rtcView} zOrder={0} /> : <Text style={styles.waiting}>{t("Waiting for {name}…", { name: memberLabel(remoteMember) })}</Text>}</View>
@@ -1386,7 +1468,7 @@ export function FamilyCallPanel({
             {t("Automatic answering requested. Waiting for the other device to connect…")}
           </Text>
         ) : null}
-        <Action label={t("Hang up")} onPress={() => void hangUp()} disabled={busy} danger />
+        <Action label={t(isOutgoingCallAttempt ? "Cancel call" : "Hang up")} onPress={() => void hangUp()} disabled={busy} danger />
       </> : !incomingCall ? <View style={styles.members}>{callableMembers.length === 0 ? <Text style={styles.waiting}>{t("Add another family member to start a call.")}</Text> : callableMembers.map((member) => <Action avatar={{ image: member.image, label: memberLabel(member) }} key={member.userId} label={t("Call {name}", { name: memberLabel(member) })} onPress={() => void beginCall(member.userId)} disabled={busy} />)}</View> : null}
       {busy ? <ActivityIndicator color="#bae6fd" style={styles.spinner} /> : null}
     </View>
@@ -1661,6 +1743,68 @@ const styles = StyleSheet.create({
   },
   members: {
     gap: 10,
+  },
+  seniorMissedCalls: {
+    backgroundColor: "#1c1917",
+    borderColor: "#78716c",
+    borderRadius: 22,
+    borderWidth: 1,
+    gap: 12,
+    maxWidth: 620,
+    padding: 16,
+    width: "100%",
+  },
+  seniorMissedCallsTitle: {
+    color: "#fbbf24",
+    fontSize: 22,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  seniorMissedCallRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 12,
+  },
+  seniorMissedCallName: {
+    color: "#fafaf9",
+    fontSize: 18,
+    fontWeight: "700",
+  },
+  seniorMissedCallTime: {
+    color: "#d6d3d1",
+    fontSize: 16,
+    marginTop: 2,
+  },
+  missedCalls: {
+    backgroundColor: "#0c4a6e",
+    borderColor: "#38bdf8",
+    borderRadius: 16,
+    borderWidth: 1,
+    gap: 10,
+    padding: 14,
+  },
+  missedCallsTitle: {
+    color: "#e0f2fe",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  missedCallRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 10,
+  },
+  missedCallText: {
+    flex: 1,
+  },
+  missedCallName: {
+    color: "#f8fafc",
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  missedCallTime: {
+    color: "#bae6fd",
+    fontSize: 13,
+    marginTop: 2,
   },
   button: {
     alignItems: "center",
