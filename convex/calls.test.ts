@@ -240,6 +240,75 @@ describe("calls", () => {
         .take(10),
     );
     expect(candidates).toEqual([]);
+    const missedCalls = await member.query(api.calls.listMissed, {
+      familyId: family._id,
+    });
+    expect(missedCalls).toEqual([
+      expect.objectContaining({ callId, callerId: ownerId }),
+    ]);
+  });
+
+  test("records canceled outgoing calls but not declined or answered calls as missed", async () => {
+    const t = convexTest({ schema, modules });
+    const { authed: caller, userId: callerId } = await createUser(
+      t,
+      "missed-caller@example.com",
+    );
+    const { authed: callee, userId: calleeId } = await createUser(
+      t,
+      "missed-callee@example.com",
+    );
+    await caller.mutation(api.families.create, { name: "Missed calls" });
+    const [family] = await caller.query(api.families.listMy, {});
+    await callee.mutation(api.families.join, { inviteCode: family.inviteCode });
+
+    const canceledCallId = await caller.mutation(api.calls.start, {
+      calleeId,
+      deviceId: "caller-phone",
+      familyId: family._id,
+      offerSdp: "canceled-offer",
+    });
+    await caller.mutation(api.calls.end, {
+      callId: canceledCallId,
+      deviceId: "caller-phone",
+    });
+
+    const declinedCallId = await caller.mutation(api.calls.start, {
+      calleeId,
+      deviceId: "caller-phone",
+      familyId: family._id,
+      offerSdp: "declined-offer",
+    });
+    await callee.mutation(api.calls.decline, {
+      callId: declinedCallId,
+      deviceId: "callee-tablet",
+    });
+
+    const answeredCallId = await caller.mutation(api.calls.start, {
+      calleeId,
+      deviceId: "caller-phone",
+      familyId: family._id,
+      offerSdp: "answered-offer",
+    });
+    await callee.mutation(api.calls.answer, {
+      answerSdp: "answer",
+      callId: answeredCallId,
+      deviceId: "callee-tablet",
+    });
+    await caller.mutation(api.calls.end, {
+      callId: answeredCallId,
+      deviceId: "caller-phone",
+    });
+
+    const missedCalls = await callee.query(api.calls.listMissed, {
+      familyId: family._id,
+    });
+    expect(missedCalls).toEqual([
+      expect.objectContaining({
+        callId: canceledCallId,
+        callerId,
+      }),
+    ]);
   });
 
   test("prevents a user from joining calls in two families at once", async () => {
