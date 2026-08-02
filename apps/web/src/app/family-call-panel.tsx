@@ -19,6 +19,7 @@ import {
   retryCallOperation,
 } from "../../../../shared/call-retry";
 import { formatCallTime } from "../../../../shared/call-time";
+import { preferVp8VideoCodec } from "../../../../shared/video-codecs";
 
 type Member = {
   email: string | null;
@@ -191,8 +192,10 @@ export function FamilyCallPanel({
   const stalledConnectionTimerRef = useRef<number | null>(null);
   const syncQueueRef = useRef<Promise<void>>(Promise.resolve());
   const relayAvailableRef = useRef(false);
+  const remoteVideoReadyRef = useRef(false);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [remoteVideoReady, setRemoteVideoReady] = useState(false);
   const [callError, setCallError] = useState<string | null>(null);
   const [busyUserId, setBusyUserId] = useState<Id<"users"> | null>(null);
   const [locallyOwnedCallId, setLocallyOwnedCallId] = useState<Id<"calls"> | null>(null);
@@ -289,6 +292,8 @@ export function FamilyCallPanel({
       setLocalStream(null);
     }
     setRemoteStream(null);
+    remoteVideoReadyRef.current = false;
+    setRemoteVideoReady(false);
     attachStreams(stopLocalTracks ? null : localStreamRef.current, null);
     currentCallIdRef.current = null;
     remoteUserIdRef.current = null;
@@ -430,6 +435,19 @@ export function FamilyCallPanel({
     stream.getTracks().forEach((track) => {
       const sender = connection.addTrack(track, stream);
       if (track.kind !== "video") return;
+      try {
+        const capabilities = typeof RTCRtpSender === "undefined"
+          ? null
+          : RTCRtpSender.getCapabilities?.("video");
+        const transceiver = connection.getTransceivers().find(
+          (candidate) => candidate.sender === sender,
+        );
+        if (capabilities && transceiver) {
+          transceiver.setCodecPreferences(preferVp8VideoCodec(capabilities.codecs));
+        }
+      } catch {
+        // Codec preferences are an optimization; negotiation can use browser defaults.
+      }
       const parameters = sender.getParameters();
       parameters.encodings ??= [{}];
       parameters.encodings[0] = {
@@ -656,7 +674,7 @@ export function FamilyCallPanel({
       activeCall?.status !== "active"
       || !isOwnedCall
       || !deviceId
-      || connectionStatus === "connected"
+      || remoteVideoReady
       || stalledConnectionTimerRef.current
     ) return;
 
@@ -671,13 +689,27 @@ export function FamilyCallPanel({
       setConnectionStatus("reconnecting");
       void retryCallOperation(() => requestIceRestart({ callId: call._id, deviceId }))
         .catch((error) => setCallError(tError(error, "Could not restore the call connection.")));
-    }, connectionStatus === "connecting" ? 12_000 : 10_000);
+    }, connectionStatus === "connecting" ? 12_000 : connectionStatus === "connected" ? 6_000 : 10_000);
 
     return () => {
       if (stalledConnectionTimerRef.current) window.clearTimeout(stalledConnectionTimerRef.current);
       stalledConnectionTimerRef.current = null;
     };
-  }, [activeCall?._id, activeCall?.iceRestartRevision, activeCall?.status, connectionStatus, currentUserId, deviceId, isOwnedCall, locallyOwnedCallId, requestIceRestart, tError]);
+  }, [activeCall?._id, activeCall?.iceRestartRevision, activeCall?.status, connectionStatus, currentUserId, deviceId, isOwnedCall, locallyOwnedCallId, remoteVideoReady, requestIceRestart, tError]);
+
+  const markRemoteVideoReady = () => {
+    const video = remoteVideoRef.current;
+    if (
+      remoteVideoReadyRef.current
+      || !video
+      || video.videoWidth <= 0
+      || video.videoHeight <= 0
+    ) return;
+    remoteVideoReadyRef.current = true;
+    setRemoteVideoReady(true);
+    setConnectionStatus("connected");
+    setCallError(null);
+  };
 
   useEffect(() => {
     return () => {
@@ -1142,6 +1174,9 @@ export function FamilyCallPanel({
             ref={remoteVideoRef}
             autoPlay
             className="block aspect-video min-w-0 w-full bg-stone-950 object-cover"
+            onCanPlay={markRemoteVideoReady}
+            onLoadedMetadata={markRemoteVideoReady}
+            onResize={markRemoteVideoReady}
             playsInline
           />
         </div>

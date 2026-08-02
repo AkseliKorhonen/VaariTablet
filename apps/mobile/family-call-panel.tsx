@@ -19,6 +19,7 @@ import {
   mediaDevices,
   MediaStream,
   RTCPeerConnection,
+  RTCRtpSender,
   RTCView,
 } from "react-native-webrtc";
 import {
@@ -49,6 +50,7 @@ import {
   retryCallOperation,
 } from "../../shared/call-retry";
 import { formatCallTime } from "../../shared/call-time";
+import { preferVp8VideoCodec } from "../../shared/video-codecs";
 
 type Member = {
   email: string | null;
@@ -243,8 +245,11 @@ export function FamilyCallPanel({
   const recoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stalledConnectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const relayAvailableRef = useRef(false);
+  const remoteVideoReadyRef = useRef(false);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [remoteVideoReady, setRemoteVideoReady] = useState(false);
+  const [remoteVideoRenderRevision, setRemoteVideoRenderRevision] = useState(0);
   const [answeringCallId, setAnsweringCallId] = useState<Id<"calls"> | null>(null);
   const [locallyOwnedCallId, setLocallyOwnedCallId] = useState<Id<"calls"> | null>(null);
   const [busy, setBusy] = useState(false);
@@ -313,8 +318,11 @@ export function FamilyCallPanel({
     localStreamPromiseRef.current = null;
     remoteFallbackStreamRef.current?.release();
     remoteFallbackStreamRef.current = null;
+    remoteVideoReadyRef.current = false;
     setLocalStream(null);
     setRemoteStream(null);
+    setRemoteVideoReady(false);
+    setRemoteVideoRenderRevision(0);
     setAnsweringCallId(null);
     setBusy(false);
     callIdRef.current = null;
@@ -425,6 +433,8 @@ export function FamilyCallPanel({
     const connection = new RTCPeerConnection({ iceServers });
     connectionRef.current = connection;
     remoteUserIdRef.current = otherUserId;
+    const remoteMediaStream = new MediaStream();
+    remoteFallbackStreamRef.current = remoteMediaStream;
 
     let stream: MediaStream;
     try {
@@ -437,10 +447,22 @@ export function FamilyCallPanel({
       }
       stream.getTracks().forEach((track) => {
         const sender = connection.addTrack(track, stream) as unknown as {
+          id?: string;
           getParameters?: () => { encodings?: Array<Record<string, unknown>>; degradationPreference?: string };
           setParameters?: (parameters: unknown) => Promise<void>;
         };
         if (track.kind !== "video" || !sender.getParameters || !sender.setParameters) return;
+        try {
+          const capabilities = RTCRtpSender.getCapabilities("video");
+          const transceiver = connection.getTransceivers().find(
+            (candidate) => candidate.sender.id === sender.id,
+          );
+          if (capabilities && transceiver) {
+            transceiver.setCodecPreferences(preferVp8VideoCodec(capabilities.codecs));
+          }
+        } catch {
+          // Codec preferences are an optimization; negotiation can use platform defaults.
+        }
         const parameters = sender.getParameters();
         parameters.encodings ??= [{}];
         parameters.encodings[0] = {
@@ -459,26 +481,20 @@ export function FamilyCallPanel({
     const events = connection as unknown as NativeConnectionEvents;
     events.ontrack = (event) => {
       if (connectionRef.current !== connection) return;
-      const nativeStream = event.streams[0];
-      if (nativeStream) {
-        if (event.track?.kind === "video" || nativeStream.getVideoTracks().length > 0) {
-          remoteFallbackStreamRef.current?.release();
-          remoteFallbackStreamRef.current = null;
-          setRemoteStream(nativeStream);
+      const tracks = [...(event.streams[0]?.getTracks() ?? [])];
+      if (event.track && !tracks.some((track) => track.id === event.track?.id)) {
+        tracks.push(event.track);
+      }
+      for (const track of tracks) {
+        if (!remoteMediaStream.getTracks().some((candidate) => candidate.id === track.id)) {
+          remoteMediaStream.addTrack(track);
         }
-        return;
       }
-
-      const track = event.track;
-      if (!track) return;
-      const fallback = remoteFallbackStreamRef.current ?? new MediaStream();
-      remoteFallbackStreamRef.current = fallback;
-      if (!fallback.getTracks().some((candidate) => candidate.id === track.id)) {
-        fallback.addTrack(track);
-      }
-      if (track.kind === "video") {
+      if (remoteMediaStream.getVideoTracks().length > 0) {
         setTimeout(() => {
-          if (remoteFallbackStreamRef.current === fallback) setRemoteStream(fallback);
+          if (remoteFallbackStreamRef.current === remoteMediaStream) {
+            setRemoteStream(remoteMediaStream);
+          }
         }, 0);
       }
     };
@@ -695,7 +711,7 @@ export function FamilyCallPanel({
     if (
       activeCall?.status !== "active"
       || !isOwnedCall
-      || connectionStatus === "connected"
+      || remoteVideoReady
       || stalledConnectionTimerRef.current
     ) return;
 
@@ -708,15 +724,24 @@ export function FamilyCallPanel({
         || !isCallOwnedByDevice(call, currentUserId, deviceId, locallyOwnedCallIdRef.current)
       ) return;
       setConnectionStatus("reconnecting");
+      setRemoteVideoRenderRevision((revision) => revision + 1);
       void retryCallOperation(() => requestIceRestart({ callId: call._id, deviceId }))
         .catch((restartError) => setError(tError(restartError, "Could not restore the call connection.")));
-    }, connectionStatus === "connecting" ? 12_000 : 10_000);
+    }, connectionStatus === "connecting" ? 12_000 : connectionStatus === "connected" ? 6_000 : 10_000);
 
     return () => {
       if (stalledConnectionTimerRef.current) clearTimeout(stalledConnectionTimerRef.current);
       stalledConnectionTimerRef.current = null;
     };
-  }, [activeCall?._id, activeCall?.iceRestartRevision, activeCall?.status, connectionStatus, currentUserId, deviceId, isOwnedCall, requestIceRestart, tError]);
+  }, [activeCall?._id, activeCall?.iceRestartRevision, activeCall?.status, connectionStatus, currentUserId, deviceId, isOwnedCall, remoteVideoReady, requestIceRestart, tError]);
+
+  const markRemoteVideoReady = () => {
+    if (remoteVideoReadyRef.current || !connectionRef.current) return;
+    remoteVideoReadyRef.current = true;
+    setRemoteVideoReady(true);
+    setConnectionStatus("connected");
+    setError(null);
+  };
 
   useEffect(() => () => teardown(), []);
 
@@ -1162,8 +1187,12 @@ export function FamilyCallPanel({
       <View style={styles.fullScreenCall}>
         {isConnected && remoteStream ? (
           <RTCView
+            key={`${remoteStream.toURL()}-${remoteVideoRenderRevision}`}
             mirror={false}
             objectFit="cover"
+            onDimensionsChange={({ nativeEvent }) => {
+              if (nativeEvent.width > 0 && nativeEvent.height > 0) markRemoteVideoReady();
+            }}
             streamURL={remoteStream.toURL()}
             style={styles.fullScreenVideo}
             zOrder={0}
@@ -1448,7 +1477,7 @@ export function FamilyCallPanel({
       ) : null}
       {isCallOnAnotherDevice ? <View style={styles.resolvedElsewhere}><Text style={styles.resolvedElsewhereText}>{callOnAnotherDeviceMessage}</Text></View> : activeCall && isOwnedCall && !isConnected ? <>
         <View style={[styles.videoGrid, { height: embeddedVideoHeight }]}>
-          <View style={styles.video}>{remoteStream ? <RTCView mirror={false} objectFit="cover" streamURL={remoteStream.toURL()} style={styles.rtcView} zOrder={0} /> : <Text style={styles.waiting}>{t("Waiting for {name}…", { name: memberLabel(remoteMember) })}</Text>}</View>
+          <View style={styles.video}>{remoteStream ? <RTCView key={`${remoteStream.toURL()}-${remoteVideoRenderRevision}`} mirror={false} objectFit="cover" onDimensionsChange={({ nativeEvent }) => { if (nativeEvent.width > 0 && nativeEvent.height > 0) markRemoteVideoReady(); }} streamURL={remoteStream.toURL()} style={styles.rtcView} zOrder={0} /> : <Text style={styles.waiting}>{t("Waiting for {name}…", { name: memberLabel(remoteMember) })}</Text>}</View>
           <View style={styles.localVideo}>{localStream ? <RTCView mirror objectFit="cover" streamURL={localStream.toURL()} style={styles.rtcView} zOrder={1} /> : null}</View>
         </View>
         {canRequestAutoAnswer ? (
