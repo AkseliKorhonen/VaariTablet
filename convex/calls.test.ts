@@ -472,6 +472,93 @@ describe("calls", () => {
     );
   });
 
+  test("coordinates ICE restarts and rejects stale candidates", async () => {
+    const t = convexTest({ schema, modules });
+    const { authed: caller, userId: callerId } = await createUser(
+      t,
+      "restart-caller@example.com",
+    );
+    const { authed: callee, userId: calleeId } = await createUser(
+      t,
+      "restart-callee@example.com",
+    );
+
+    await caller.mutation(api.families.create, { name: "Resilient calls" });
+    const [family] = await caller.query(api.families.listMy, {});
+    await callee.mutation(api.families.join, { inviteCode: family.inviteCode });
+    const callId = await caller.mutation(api.calls.start, {
+      calleeId,
+      deviceId: "caller-phone",
+      familyId: family._id,
+      offerSdp: "initial-offer",
+    });
+    await callee.mutation(api.calls.answer, {
+      answerSdp: "initial-answer",
+      callId,
+      deviceId: "callee-tablet",
+    });
+
+    const revision = await callee.mutation(api.calls.requestIceRestart, {
+      callId,
+      deviceId: "callee-tablet",
+    });
+    expect(revision).toBe(1);
+    expect(await caller.mutation(api.calls.requestIceRestart, {
+      callId,
+      deviceId: "caller-phone",
+    })).toBe(1);
+
+    await expect(caller.mutation(api.calls.addIceCandidate, {
+      callId,
+      candidate: "stale-candidate",
+      deviceId: "caller-phone",
+      negotiationRevision: 0,
+      recipientId: calleeId,
+    })).rejects.toThrow("Network negotiation is out of date");
+
+    await caller.mutation(api.calls.submitIceRestartOffer, {
+      callId,
+      deviceId: "caller-phone",
+      offerSdp: "restart-offer",
+      revision,
+    });
+    await expect(caller.mutation(api.calls.submitIceRestartAnswer, {
+      answerSdp: "invalid-answer",
+      callId,
+      deviceId: "caller-phone",
+      revision,
+    })).rejects.toThrow("Only the callee can answer a connection restart");
+    await callee.mutation(api.calls.submitIceRestartAnswer, {
+      answerSdp: "restart-answer",
+      callId,
+      deviceId: "callee-tablet",
+      revision,
+    });
+    await callee.mutation(api.calls.addIceCandidate, {
+      callId,
+      candidate: "fresh-candidate",
+      deviceId: "callee-tablet",
+      negotiationRevision: revision,
+      recipientId: callerId,
+    });
+
+    const restarted = await caller.query(api.calls.watch, {
+      deviceId: "caller-phone",
+      familyId: family._id,
+    });
+    expect(restarted.call).toMatchObject({
+      iceRestartAnswerSdp: "restart-answer",
+      iceRestartOfferSdp: "restart-offer",
+      iceRestartRevision: revision,
+    });
+    expect(restarted.candidates).toEqual([
+      expect.objectContaining({
+        candidate: "fresh-candidate",
+        negotiationRevision: revision,
+      }),
+    ]);
+  });
+
   test("rotates and unregisters push tokens per authenticated device", async () => {
     const t = convexTest({ schema, modules });
     const { authed: user, userId } = await createUser(
