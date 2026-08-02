@@ -6,6 +6,7 @@ import { v } from "convex/values";
 const RINGING_TIMEOUT_MS = 2 * 60 * 1000;
 const ACTIVE_CALL_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const AUTO_ANSWER_DELAY_MS = 10 * 1000;
+const ICE_RESTART_COOLDOWN_MS = 3 * 1000;
 const EXPIRY_BATCH_SIZE = 100;
 
 function createNativeCallId() {
@@ -147,8 +148,9 @@ async function getCandidatesForDevice(ctx, call, userId, deviceId) {
   const expectedSenderDeviceId = isCaller
     ? call.answeredByDeviceId
     : call.callerDeviceId;
+  let candidates;
   if (expectedSenderDeviceId !== undefined) {
-    return await ctx.db
+    candidates = await ctx.db
       .query("callIceCandidates")
       .withIndex(
         "by_callId_and_recipientId_and_senderDeviceId",
@@ -160,16 +162,21 @@ async function getCandidatesForDevice(ctx, call, userId, deviceId) {
       )
       .order("asc")
       .take(100);
+  } else {
+    // Calls created during a rolling upgrade may not yet have device fields.
+    candidates = await ctx.db
+      .query("callIceCandidates")
+      .withIndex("by_callId_and_recipientId", (q) =>
+        q.eq("callId", call._id).eq("recipientId", userId),
+      )
+      .order("asc")
+      .take(100);
   }
 
-  // Calls created during a rolling upgrade may not yet have device fields.
-  return await ctx.db
-    .query("callIceCandidates")
-    .withIndex("by_callId_and_recipientId", (q) =>
-      q.eq("callId", call._id).eq("recipientId", userId),
-    )
-    .order("asc")
-    .take(100);
+  const negotiationRevision = call.iceRestartRevision ?? 0;
+  return candidates.filter(
+    (candidate) => (candidate.negotiationRevision ?? 0) === negotiationRevision,
+  );
 }
 
 export const watch = query({
@@ -480,6 +487,93 @@ export const end = mutation({
   },
 });
 
+export const requestIceRestart = mutation({
+  args: {
+    callId: v.id("calls"),
+    deviceId: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    const call = await getCallForUser(ctx, args.callId, userId);
+
+    if (call.status !== "active") {
+      throw new Error("Call is no longer active");
+    }
+    if (!deviceOwnsActiveCall(call, userId, args.deviceId)) {
+      throw new Error("This device does not own the call");
+    }
+
+    const now = Date.now();
+    if (
+      call.iceRestartRequestedAt !== undefined
+      && now - call.iceRestartRequestedAt < ICE_RESTART_COOLDOWN_MS
+    ) {
+      return call.iceRestartRevision ?? 0;
+    }
+
+    const revision = (call.iceRestartRevision ?? 0) + 1;
+    await ctx.db.patch(call._id, {
+      iceRestartRevision: revision,
+      iceRestartRequestedAt: now,
+      iceRestartOfferSdp: undefined,
+      iceRestartAnswerSdp: undefined,
+    });
+    await deleteIceCandidates(ctx, call._id);
+    return revision;
+  },
+});
+
+export const submitIceRestartOffer = mutation({
+  args: {
+    callId: v.id("calls"),
+    deviceId: v.optional(v.string()),
+    revision: v.number(),
+    offerSdp: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    const call = await getCallForUser(ctx, args.callId, userId);
+    if (call.status !== "active") throw new Error("Call is no longer active");
+    if (call.callerId !== userId) throw new Error("Only the caller can restart the connection");
+    if (!deviceOwnsActiveCall(call, userId, args.deviceId)) {
+      throw new Error("This device does not own the call");
+    }
+    if ((call.iceRestartRevision ?? 0) !== args.revision) {
+      throw new Error("Network negotiation is out of date");
+    }
+
+    await ctx.db.patch(call._id, {
+      iceRestartOfferSdp: args.offerSdp,
+      iceRestartAnswerSdp: undefined,
+    });
+    return call._id;
+  },
+});
+
+export const submitIceRestartAnswer = mutation({
+  args: {
+    callId: v.id("calls"),
+    deviceId: v.optional(v.string()),
+    revision: v.number(),
+    answerSdp: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    const call = await getCallForUser(ctx, args.callId, userId);
+    if (call.status !== "active") throw new Error("Call is no longer active");
+    if (call.calleeId !== userId) throw new Error("Only the callee can answer a connection restart");
+    if (!deviceOwnsActiveCall(call, userId, args.deviceId)) {
+      throw new Error("This device does not own the call");
+    }
+    if ((call.iceRestartRevision ?? 0) !== args.revision || !call.iceRestartOfferSdp) {
+      throw new Error("Network negotiation is out of date");
+    }
+
+    await ctx.db.patch(call._id, { iceRestartAnswerSdp: args.answerSdp });
+    return call._id;
+  },
+});
+
 export const expireStale = internalMutation({
   args: {},
   handler: async (ctx) => {
@@ -532,6 +626,7 @@ export const addIceCandidate = mutation({
     sdpMid: v.optional(v.string()),
     sdpMLineIndex: v.optional(v.number()),
     usernameFragment: v.optional(v.string()),
+    negotiationRevision: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const senderId = await requireUserId(ctx);
@@ -558,6 +653,11 @@ export const addIceCandidate = mutation({
       throw new Error("This device does not own the call");
     }
 
+    const negotiationRevision = call.iceRestartRevision ?? 0;
+    if ((args.negotiationRevision ?? 0) !== negotiationRevision) {
+      throw new Error("Network negotiation is out of date");
+    }
+
     const senderDeviceId =
       args.deviceId ??
       (senderId === call.callerId
@@ -573,6 +673,7 @@ export const addIceCandidate = mutation({
       sdpMid: args.sdpMid,
       sdpMLineIndex: args.sdpMLineIndex,
       usernameFragment: args.usernameFragment,
+      ...(negotiationRevision === 0 ? {} : { negotiationRevision }),
       createdAt: Date.now(),
     });
   },

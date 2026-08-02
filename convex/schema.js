@@ -59,6 +59,10 @@ export default defineSchema({
     callerDeviceId: v.optional(v.string()),
     answerSdp: v.optional(v.string()),
     answeredByDeviceId: v.optional(v.string()),
+    iceRestartRevision: v.optional(v.number()),
+    iceRestartRequestedAt: v.optional(v.number()),
+    iceRestartOfferSdp: v.optional(v.string()),
+    iceRestartAnswerSdp: v.optional(v.string()),
     autoAnswerOfferedByDeviceId: v.optional(v.string()),
     autoAnswerOfferedAt: v.optional(v.number()),
     autoAnswerRequestedAt: v.optional(v.number()),
@@ -80,6 +84,7 @@ export default defineSchema({
     sdpMid: v.optional(v.string()),
     sdpMLineIndex: v.optional(v.number()),
     usernameFragment: v.optional(v.string()),
+    negotiationRevision: v.optional(v.number()),
     createdAt: v.number(),
   })
     .index("by_callId", ["callId"])

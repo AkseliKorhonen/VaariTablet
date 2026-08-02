@@ -9,6 +9,15 @@ const DEFAULT_ICE_SERVERS = [
   },
 ];
 
+function hasTurnServer(iceServers) {
+  return iceServers.some((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some(
+      (url) => typeof url === "string" && /^turns?:/i.test(url),
+    );
+  });
+}
+
 export const getIceServers = action({
   args: {},
   handler: async (ctx) => {
@@ -23,6 +32,7 @@ export const getIceServers = action({
     if (!turnKeyId || !turnApiToken) {
       return {
         iceServers: DEFAULT_ICE_SERVERS,
+        relayAvailable: false,
         source: "stun-only",
       };
     }
@@ -40,13 +50,19 @@ export const getIceServers = action({
     );
 
     if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Could not load TURN credentials: ${body}`);
+      throw new Error(`Could not load TURN credentials (${response.status})`);
     }
 
     const payload = await response.json();
+    const iceServers = Array.isArray(payload.iceServers)
+      ? payload.iceServers
+      : DEFAULT_ICE_SERVERS;
+    if (!hasTurnServer(iceServers)) {
+      throw new Error("The TURN service returned no relay servers");
+    }
     return {
-      iceServers: payload.iceServers ?? DEFAULT_ICE_SERVERS,
+      iceServers,
+      relayAvailable: true,
       source: "cloudflare-turn",
     };
   },

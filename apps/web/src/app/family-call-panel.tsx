@@ -14,6 +14,10 @@ import {
 import { getOrCreateWebDeviceId } from "./web-device-identity";
 import { useLanguage } from "./language";
 import { MemberAvatar } from "./member-avatar";
+import {
+  isStaleNegotiationError,
+  retryCallOperation,
+} from "../../../../shared/call-retry";
 
 type Member = {
   email: string | null;
@@ -42,6 +46,9 @@ type CallSnapshot = {
     calleeId: Id<"users">;
     callerDeviceId?: string;
     callerId: Id<"users">;
+    iceRestartAnswerSdp?: string;
+    iceRestartOfferSdp?: string;
+    iceRestartRevision?: number;
     offerSdp: string;
     status: "active" | "declined" | "ended" | "ringing";
   };
@@ -54,6 +61,7 @@ type CallSnapshot = {
     sdpMLineIndex?: number;
     senderId: Id<"users">;
     usernameFragment?: string;
+    negotiationRevision?: number;
   }>;
 };
 
@@ -62,6 +70,7 @@ type PendingIceCandidate = {
   sdpMid?: string;
   sdpMLineIndex?: number;
   usernameFragment?: string;
+  negotiationRevision: number;
 };
 
 type Call = NonNullable<CallSnapshot["call"]>;
@@ -115,6 +124,9 @@ async function requestLocalMedia() {
       audio: true,
       video: {
         facingMode: "user",
+        frameRate: { ideal: 15, max: 24 },
+        height: { ideal: 360, max: 720 },
+        width: { ideal: 640, max: 1280 },
       },
     },
     {
@@ -160,12 +172,21 @@ export function FamilyCallPanel({
   const handledElsewhereCallIdRef = useRef<Id<"calls"> | null>(null);
   const processedCandidateIdsRef = useRef<Set<Id<"callIceCandidates">>>(new Set());
   const pendingIceCandidatesRef = useRef<PendingIceCandidate[]>([]);
+  const negotiationRevisionRef = useRef(0);
+  const restartOfferRevisionRef = useRef(0);
+  const restartAnswerRevisionRef = useRef(0);
+  const preparedRestartRevisionRef = useRef(0);
+  const recoveryTimerRef = useRef<number | null>(null);
+  const stalledConnectionTimerRef = useRef<number | null>(null);
+  const syncQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const relayAvailableRef = useRef(false);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [callError, setCallError] = useState<string | null>(null);
   const [busyUserId, setBusyUserId] = useState<Id<"users"> | null>(null);
   const [locallyOwnedCallId, setLocallyOwnedCallId] = useState<Id<"calls"> | null>(null);
   const [isPhoneViewport, setIsPhoneViewport] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<"connecting" | "connected" | "reconnecting">("connecting");
   const deviceId = useSyncExternalStore(
     subscribeToWebDeviceIdentity,
     getOrCreateWebDeviceId,
@@ -182,6 +203,9 @@ export function FamilyCallPanel({
   const endCall = useMutation(api.calls.end);
   const addIceCandidate = useMutation(api.calls.addIceCandidate);
   const requestAutoAnswer = useMutation(api.calls.requestAutoAnswer);
+  const requestIceRestart = useMutation(api.calls.requestIceRestart);
+  const submitIceRestartOffer = useMutation(api.calls.submitIceRestartOffer);
+  const submitIceRestartAnswer = useMutation(api.calls.submitIceRestartAnswer);
 
   useEffect(() => {
     const phoneMedia = window.matchMedia("(max-width: 639px)");
@@ -239,6 +263,11 @@ export function FamilyCallPanel({
   const teardownConnection = useCallback((stopLocalTracks: boolean) => {
     mediaRequestGenerationRef.current += 1;
     callGenerationRef.current += 1;
+    if (recoveryTimerRef.current) clearTimeout(recoveryTimerRef.current);
+    recoveryTimerRef.current = null;
+    if (stalledConnectionTimerRef.current) clearTimeout(stalledConnectionTimerRef.current);
+    stalledConnectionTimerRef.current = null;
+    syncQueueRef.current = Promise.resolve();
     peerConnectionRef.current?.close();
     peerConnectionRef.current = null;
     if (stopLocalTracks) {
@@ -255,6 +284,12 @@ export function FamilyCallPanel({
     setLocallyOwnedCallId(null);
     processedCandidateIdsRef.current = new Set();
     pendingIceCandidatesRef.current = [];
+    negotiationRevisionRef.current = 0;
+    restartOfferRevisionRef.current = 0;
+    restartAnswerRevisionRef.current = 0;
+    preparedRestartRevisionRef.current = 0;
+    relayAvailableRef.current = false;
+    setConnectionStatus("connecting");
     setBusyUserId(null);
   }, [attachStreams]);
 
@@ -296,6 +331,7 @@ export function FamilyCallPanel({
       return;
     }
 
+    const negotiationRevision = snapshot.call?.iceRestartRevision ?? 0;
     for (const candidate of snapshot.candidates) {
       if (processedCandidateIdsRef.current.has(candidate._id)) {
         continue;
@@ -311,6 +347,7 @@ export function FamilyCallPanel({
       ) {
         continue;
       }
+      if ((candidate.negotiationRevision ?? 0) !== negotiationRevision) continue;
       await peerConnection.addIceCandidate({
         candidate: candidate.candidate,
         sdpMid: candidate.sdpMid ?? undefined,
@@ -329,7 +366,12 @@ export function FamilyCallPanel({
       return;
     }
 
-    await addIceCandidate({ callId, deviceId, recipientId, ...candidate });
+    await retryCallOperation(() => addIceCandidate({
+      callId,
+      deviceId,
+      recipientId,
+      ...candidate,
+    }));
   };
 
   const flushPendingIceCandidates = async () => {
@@ -346,6 +388,7 @@ export function FamilyCallPanel({
   const createPeerConnection = async (otherUserId: Id<"users">) => {
     const generation = callGenerationRef.current;
     const credentials = await getIceServers({});
+    relayAvailableRef.current = credentials.relayAvailable;
     if (generation !== callGenerationRef.current) {
       throw new Error("The call ended before the connection was ready.");
     }
@@ -373,7 +416,17 @@ export function FamilyCallPanel({
     const nextRemoteStream = new MediaStream();
 
     stream.getTracks().forEach((track) => {
-      connection.addTrack(track, stream);
+      const sender = connection.addTrack(track, stream);
+      if (track.kind !== "video") return;
+      const parameters = sender.getParameters();
+      parameters.encodings ??= [{}];
+      parameters.encodings[0] = {
+        ...parameters.encodings[0],
+        maxBitrate: 650_000,
+        maxFramerate: 24,
+      };
+      parameters.degradationPreference = "balanced";
+      void sender.setParameters(parameters).catch(() => undefined);
     });
     connection.ontrack = (event) => {
       if (peerConnectionRef.current !== connection) return;
@@ -393,10 +446,45 @@ export function FamilyCallPanel({
         sdpMid: event.candidate.sdpMid ?? undefined,
         sdpMLineIndex: event.candidate.sdpMLineIndex ?? undefined,
         usernameFragment: event.candidate.usernameFragment ?? undefined,
+        negotiationRevision: negotiationRevisionRef.current,
       }).catch((error) => {
-        setCallError(tError(error, "Could not send network details."));
+        if (!isStaleNegotiationError(error)) {
+          setCallError(tError(error, "Could not send network details."));
+        }
       });
     };
+    const handleConnectionState = () => {
+      if (peerConnectionRef.current !== connection) return;
+      const state = connection.connectionState;
+      if (state === "connected") {
+        if (recoveryTimerRef.current) clearTimeout(recoveryTimerRef.current);
+        recoveryTimerRef.current = null;
+        setConnectionStatus("connected");
+        setCallError(null);
+        return;
+      }
+      if (state !== "disconnected" && state !== "failed") return;
+      setConnectionStatus("reconnecting");
+      if (state === "failed" && !relayAvailableRef.current) {
+        setCallError(t("No relay server is configured. This network may block the video connection."));
+      }
+      if (recoveryTimerRef.current) return;
+      recoveryTimerRef.current = window.setTimeout(() => {
+        recoveryTimerRef.current = null;
+        const call = watchRef.current?.call;
+        if (
+          peerConnectionRef.current !== connection
+          || !call
+          || call.status !== "active"
+          || !deviceId
+          || !isCallOwnedByDevice(call, currentUserId, deviceId, locallyOwnedCallId)
+        ) return;
+        void retryCallOperation(() => requestIceRestart({ callId: call._id, deviceId }))
+          .catch((error) => setCallError(tError(error, "Could not restore the call connection.")));
+      }, state === "failed" ? 0 : 4_000);
+    };
+    connection.onconnectionstatechange = handleConnectionState;
+    connection.oniceconnectionstatechange = handleConnectionState;
 
     setRemoteStream(nextRemoteStream);
     attachStreams(stream, nextRemoteStream);
@@ -441,7 +529,7 @@ export function FamilyCallPanel({
     const generation = callGenerationRef.current;
     const syncCall = async () => {
       const connection = peerConnectionRef.current;
-      if (!activeCall || !isOwnedCall || !connection) {
+      if (!activeCall || !isOwnedCall || !connection || !deviceId) {
         return;
       }
 
@@ -462,6 +550,80 @@ export function FamilyCallPanel({
         }
       }
 
+      const revision = activeCall.iceRestartRevision ?? 0;
+      if (revision > 0 && preparedRestartRevisionRef.current < revision) {
+        preparedRestartRevisionRef.current = revision;
+        try {
+          const credentials = await retryCallOperation(() => getIceServers({}));
+          relayAvailableRef.current = credentials.relayAvailable;
+          connection.setConfiguration({ iceServers: credentials.iceServers });
+        } catch (error) {
+          preparedRestartRevisionRef.current = revision - 1;
+          throw error;
+        }
+      }
+      if (
+        revision > 0
+        && activeCall.callerId === currentUserId
+        && restartOfferRevisionRef.current < revision
+      ) {
+        restartOfferRevisionRef.current = revision;
+        negotiationRevisionRef.current = revision;
+        processedCandidateIdsRef.current = new Set();
+        try {
+          connection.restartIce();
+          const offer = await connection.createOffer({ iceRestart: true });
+          await connection.setLocalDescription(offer);
+          await retryCallOperation(() => submitIceRestartOffer({
+            callId: activeCall._id,
+            deviceId,
+            offerSdp: serializeDescription(connection.localDescription ?? offer),
+            revision,
+          }));
+        } catch (error) {
+          restartOfferRevisionRef.current = revision - 1;
+          throw error;
+        }
+      }
+      if (
+        revision > 0
+        && activeCall.calleeId === currentUserId
+        && activeCall.iceRestartOfferSdp
+        && restartAnswerRevisionRef.current < revision
+      ) {
+        restartAnswerRevisionRef.current = revision;
+        negotiationRevisionRef.current = revision;
+        processedCandidateIdsRef.current = new Set();
+        try {
+          await connection.setRemoteDescription(parseDescription(activeCall.iceRestartOfferSdp));
+          const answer = await connection.createAnswer();
+          await connection.setLocalDescription(answer);
+          await retryCallOperation(() => submitIceRestartAnswer({
+            answerSdp: serializeDescription(connection.localDescription ?? answer),
+            callId: activeCall._id,
+            deviceId,
+            revision,
+          }));
+        } catch (error) {
+          restartAnswerRevisionRef.current = revision - 1;
+          throw error;
+        }
+      }
+      if (
+        revision > 0
+        && activeCall.callerId === currentUserId
+        && activeCall.iceRestartAnswerSdp
+        && restartAnswerRevisionRef.current < revision
+      ) {
+        restartAnswerRevisionRef.current = revision;
+        try {
+          await connection.setRemoteDescription(parseDescription(activeCall.iceRestartAnswerSdp));
+        } catch (error) {
+          restartAnswerRevisionRef.current = revision - 1;
+          throw error;
+        }
+      }
+
       if (
         generation !== callGenerationRef.current
         || peerConnectionRef.current !== connection
@@ -469,11 +631,41 @@ export function FamilyCallPanel({
       await flushCandidates();
     };
 
-    void syncCall().catch((error) => {
+    const queuedSync = syncQueueRef.current.catch(() => undefined).then(syncCall);
+    syncQueueRef.current = queuedSync;
+    void queuedSync.catch((error) => {
       if (generation !== callGenerationRef.current) return;
       setCallError(tError(error, "Could not sync call state."));
     });
   }, [activeCall, currentUserId, callState, flushCandidates, isOwnedCall, tError]);
+
+  useEffect(() => {
+    if (
+      activeCall?.status !== "active"
+      || !isOwnedCall
+      || !deviceId
+      || connectionStatus === "connected"
+      || stalledConnectionTimerRef.current
+    ) return;
+
+    stalledConnectionTimerRef.current = window.setTimeout(() => {
+      stalledConnectionTimerRef.current = null;
+      const call = watchRef.current?.call;
+      if (
+        !call
+        || call.status !== "active"
+        || !isCallOwnedByDevice(call, currentUserId, deviceId, locallyOwnedCallId)
+      ) return;
+      setConnectionStatus("reconnecting");
+      void retryCallOperation(() => requestIceRestart({ callId: call._id, deviceId }))
+        .catch((error) => setCallError(tError(error, "Could not restore the call connection.")));
+    }, connectionStatus === "connecting" ? 12_000 : 10_000);
+
+    return () => {
+      if (stalledConnectionTimerRef.current) window.clearTimeout(stalledConnectionTimerRef.current);
+      stalledConnectionTimerRef.current = null;
+    };
+  }, [activeCall?._id, activeCall?.iceRestartRevision, activeCall?.status, connectionStatus, currentUserId, deviceId, isOwnedCall, locallyOwnedCallId, requestIceRestart, tError]);
 
   useEffect(() => {
     return () => {
@@ -505,7 +697,7 @@ export function FamilyCallPanel({
         familyId,
         calleeId,
         deviceId,
-        offerSdp: serializeDescription(offer),
+        offerSdp: serializeDescription(connection.localDescription ?? offer),
       });
       if (generation !== callGenerationRef.current) return;
       currentCallIdRef.current = callId;
@@ -548,7 +740,7 @@ export function FamilyCallPanel({
       await answerCall({
         callId: incomingCall._id,
         deviceId,
-        answerSdp: serializeDescription(answer),
+        answerSdp: serializeDescription(connection.localDescription ?? answer),
       });
       if (generation !== callGenerationRef.current) return;
       setLocallyOwnedCallId(incomingCall._id);
@@ -777,6 +969,12 @@ export function FamilyCallPanel({
       {isCallOnAnotherDevice ? (
         <p className="rounded-2xl border border-sky-300/30 bg-sky-300/10 px-4 py-3 text-sm text-sky-100">
           {callOnAnotherDeviceMessage}
+        </p>
+      ) : null}
+
+      {isOwnedCall && connectionStatus === "reconnecting" ? (
+        <p aria-live="polite" className="rounded-2xl border border-amber-300/30 bg-amber-300/10 px-4 py-3 text-sm text-amber-100">
+          {t("Restoring the video connection…")}
         </p>
       ) : null}
 
