@@ -47,27 +47,27 @@
   },
   "homepage": "https://rinnalla.app",
   "dependencies": {
-    "@auth/core": "^0.41.1",
-    "@convex-dev/auth": "^0.0.94",
-    "@convex-dev/migrations": "^0.3.5",
+    "@auth/core": "^0.41.3",
+    "@convex-dev/auth": "^0.0.95",
+    "@convex-dev/migrations": "^0.3.6",
     "@oslojs/crypto": "^1.0.1",
-    "convex": "^1.42.3",
+    "convex": "^1.44.0",
     "dotenv": "^17.4.2",
     "firebase-admin": "^13.10.0",
-    "resend": "^6.17.2"
+    "resend": "^6.20.0"
   },
   "devDependencies": {
     "@edge-runtime/vm": "^5.0.0",
     "@eslint/js": "^9.39.5",
-    "convex-test": "^0.0.54",
+    "convex-test": "^0.0.55",
     "eslint": "^9.39.5",
     "expo-doctor": "1.20.1",
     "globals": "^16.5.0",
-    "next": "^16.2.10",
+    "next": "^16.3.1",
     "patch-package": "^8.0.1",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
-    "typescript-eslint": "^8.64.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "typescript-eslint": "^8.67.0",
     "vitest": "^4.1.10"
   }
 }
